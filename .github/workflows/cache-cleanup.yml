@@ -1,0 +1,103 @@
+# Reusable housekeeping for the caller repo's GitHub Actions cache (10 GB per repo; the
+# oldest entries are evicted without notice once it is full, and the daily-rotated BuildKit
+# scopes fill it with entries that can never be read again). Run it from a schedule.
+#
+# Deletes a cache when any of these holds, first match wins:
+#   ref gone       the branch is deleted or the pull request is closed (a cache is
+#                  readable only from its own ref, its base and the default branch)
+#   rotated scope  a BuildKit index (index-<scope>-<YYYYMMDD>-...) whose date scope is
+#                  older than yesterday; the build-image workflow reads only today's
+#   idle           not accessed for max-idle-days (BuildKit blobs have no scope or date in
+#                  the key, so the rotated indexes' blobs leave through this rule)
+#   superseded     an older entry of a keep-newest-prefixes key family on the same ref
+#
+# Policy: no third-party actions; the gh CLI on the runner does the work.
+name: cache-cleanup
+
+on:
+  workflow_call:
+    inputs:
+      max-idle-days:
+        description: "Delete caches not accessed for this many days"
+        required: false
+        type: number
+        default: 7
+      keep-newest-prefixes:
+        description: "Space-separated key prefixes of which only the newest cache per ref is kept"
+        required: false
+        type: string
+        default: "cache-trivy-"
+      dry-run:
+        description: "Print the plan, delete nothing"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write # list and delete caches
+      contents: read # list branches
+      pull-requests: read # list open pull requests
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MAX_IDLE_DAYS: ${{ inputs.max-idle-days }}
+      KEEP_NEWEST_PREFIXES: ${{ inputs.keep-newest-prefixes }}
+      DRY_RUN: ${{ inputs.dry-run }}
+    steps:
+      - name: Delete stale Actions caches
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          gh api --paginate "repos/$repo/actions/caches?per_page=100" --jq '.actions_caches[]' | jq -s '.' >"$work/caches.json"
+          {
+            gh api --paginate "repos/$repo/branches?per_page=100" --jq '.[].name | "refs/heads/" + .'
+            gh api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq '.[].number | "refs/pull/\(.)/merge"'
+          } | jq -R . | jq -s '.' >"$work/live.json"
+
+          plan="$(jq -n --slurpfile caches "$work/caches.json" --slurpfile live "$work/live.json" \
+            --argjson idle "$(( $(date -u +%s) - MAX_IDLE_DAYS * 86400 ))" \
+            --arg scope_cutoff "$(date -u -d yesterday +%Y%m%d)" \
+            --arg prefixes "$KEEP_NEWEST_PREFIXES" '
+            ($prefixes | split(" ") | map(select(length > 0))) as $pre
+            | ($live[0] | map({(.): true}) | add // {}) as $alive
+            | [ $caches[0][] | . + { why:
+                ( if $alive[.ref] == null then "ref gone"
+                  elif (.key | test("^index-(.*-)?[0-9]{8}-[0-9]+-[0-9a-f]+(#[0-9]+)?$"))
+                       and ((.key | capture("(?<d>[0-9]{8})-[0-9]+-[0-9a-f]+(#[0-9]+)?$").d) < $scope_cutoff)
+                    then "rotated scope"
+                  elif (.last_accessed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) < $idle then "idle"
+                  else null end ) } ] as $marked
+            | ( [ $marked[] | select(.why == null) | . as $c
+                  | ($pre | map(select(. as $p | $c.key | startswith($p)))[0]) as $family
+                  | select($family != null) | . + { family: $family } ]
+                | group_by([.ref, .family])
+                | map(sort_by(.created_at) | reverse | .[1:][] | {(.id | tostring): true})
+                | add // {} ) as $old
+            | [ $marked[]
+                | if .why == null and $old[.id | tostring] then .why = "superseded" else . end
+                | select(.why != null)
+                | { id, key, ref, size: .size_in_bytes, why } ]')"
+
+          total="$(jq '[.[].size_in_bytes] | add // 0' "$work/caches.json")"
+          {
+            echo "### Actions caches: $(jq 'length' "$work/caches.json") entries, $((total / 1048576)) MB before"
+            echo
+            echo "| reason | entries | MB |"
+            echo "| --- | ---: | ---: |"
+            jq -r 'group_by(.why)[] | "| \(.[0].why) | \(length) | \(([.[].size] | add) / 1048576 | floor) |"' <<<"$plan"
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          jq -r '.[] | "\(.why)\t\(.ref)\t\(.key[0:80])"' <<<"$plan" | sort | sed -n '1,300p'
+          if [ "$DRY_RUN" = true ]; then
+            echo "dry run: nothing deleted"
+            exit 0
+          fi
+          for id in $(jq -r '.[].id' <<<"$plan"); do
+            gh api -X DELETE "repos/$repo/actions/caches/$id" --silent || echo "::warning::could not delete cache $id"
+          done
+          echo "deleted $(jq 'length' <<<"$plan") entries, $(( $(jq '[.[].size] | add // 0' <<<"$plan") / 1048576 )) MB"

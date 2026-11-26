@@ -137,11 +137,31 @@ jobs:
         # the Trivy gate starts failing on fixable CVEs. Rotating the scope
         # daily keeps retries of the same day fast while guaranteeing the
         # weekly rebuild (and any PR) actually re-runs the package install.
+        #
+        # Only pull_request and push runs touch the cache. Scheduled and manual
+        # runs exist to pick up package updates, so they start cold and write
+        # nothing; a fork PR gets no cache at all. A pull request exports from
+        # the test build (it never publishes). A push exports only from the
+        # publish build: the test build is amd64-only, and an export from it
+        # would be the newest index when the publish build imports, hiding the
+        # previous run's arm64 layers.
+        env:
+          PUBLISH: ${{ inputs.push }}
+          FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            [ "$FORK_PR" = false ] || exit 0
+          elif [ "$GITHUB_EVENT_NAME" != push ]; then
+            exit 0
+          fi
           scope="${{ inputs.cache-scope }}${{ inputs.cache-scope != '' && '-' || '' }}$(date -u +%Y%m%d)"
           echo "CACHE_FROM=type=gha,scope=$scope" >> "$GITHUB_ENV"
-          echo "CACHE_TO=type=gha,mode=max,scope=$scope" >> "$GITHUB_ENV"
+          if [ "$PUBLISH" = true ]; then
+            echo "CACHE_TO_PUBLISH=type=gha,mode=max,scope=$scope" >> "$GITHUB_ENV"
+          else
+            echo "CACHE_TO_TEST=type=gha,mode=max,scope=$scope" >> "$GITHUB_ENV"
+          fi
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -173,7 +193,7 @@ jobs:
           build-args: ${{ inputs.build-args }}
           target: ${{ inputs.target }}
           cache-from: ${{ env.CACHE_FROM }}
-          cache-to: ${{ env.CACHE_TO }}
+          cache-to: ${{ env.CACHE_TO_TEST }}
 
       - name: Test
         if: inputs.test-command != ''
@@ -190,6 +210,7 @@ jobs:
           exit-code: "1"
           severity: ${{ inputs.trivy-severity }}
           ignore-unfixed: ${{ inputs.trivy-ignore-unfixed }}
+          cache: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
           version: v0.76.2
 
       # Opt-in (kev-gate). Docker Scout's "no high-profile vulnerabilities" policy: no
@@ -326,7 +347,7 @@ jobs:
           build-args: ${{ inputs.build-args }}
           target: ${{ inputs.target }}
           cache-from: ${{ env.CACHE_FROM }}
-          cache-to: ${{ env.CACHE_TO }}
+          cache-to: ${{ env.CACHE_TO_PUBLISH }}
 
       - name: Install Cosign
         if: inputs.push && inputs.cosign
