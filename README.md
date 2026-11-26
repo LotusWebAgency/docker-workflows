@@ -25,7 +25,7 @@ jobs:
     secrets: inherit
 ```
 
-Key inputs (see the workflow file for the full list): `namespace` (defaults to the `DOCKERHUB_USERNAME` secret), `dockerfile`, `context`, `target` (Dockerfile stage), `platforms`, `build-args`, `labels` (metadata-action spec), `cache-scope` (set per matrix entry; the GHA cache scope rotates daily so package layers cannot go stale), `test-command` (runs with `$IMAGE` pointing at the locally built amd64 image), `version-command` / `version-tag-suffix`, `trivy-severity` / `trivy-ignore-unfixed`, `kev-gate`, `license-gate`, `cosign`, `timeout-minutes`.
+Key inputs (see the workflow file for the full list): `namespace` (defaults to the `DOCKERHUB_USERNAME` secret), `dockerfile`, `context`, `target` (Dockerfile stage), `platforms`, `build-args`, `labels` (metadata-action spec), `cache-scope` (set per matrix entry; the GHA cache scope rotates daily so package layers cannot go stale; only pull-request (not fork) and push runs use the cache, scheduled and manual runs build cold), `test-command` (runs with `$IMAGE` pointing at the locally built amd64 image), `version-command` / `version-tag-suffix`, `trivy-severity` / `trivy-ignore-unfixed`, `kev-gate`, `license-gate`, `cosign`, `timeout-minutes`.
 
 `environment` (a caller-repo environment holding `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN`, e.g. `release` restricted to `main`): `build-image.yml` enters it only when `push` is true, so pull-request runs never see the credentials. `sync-description.yml` takes the same input. The caller must still pass `secrets: inherit`: a called workflow resolves environment secrets only through inherited secrets ([actions/runner#4453](https://github.com/actions/runner/issues/4453)).
 
@@ -78,6 +78,19 @@ Pushes the caller's `DOCKERHUB.md` to the image's Docker Hub description. Run it
       image: angie
       short-description: "Alpine Angie reverse-proxy…"
     secrets: inherit
+```
+
+### `cache-cleanup.yml`
+
+Housekeeping for the caller's GitHub Actions cache. Call it from a daily `schedule` (plus `workflow_dispatch` with a dry-run input); the job needs `actions: write`, `contents: read` and `pull-requests: read`. It deletes caches of closed pull requests and deleted branches, BuildKit indexes whose date scope is older than yesterday, caches idle for `max-idle-days` (default 7; this is how the scope-less BuildKit blobs leave) and all but the newest cache per ref for each `keep-newest-prefixes` key family (default `cache-trivy-`). `dry-run` prints the plan only.
+
+```yaml
+  cleanup:
+    uses: vdementev/docker-workflows/.github/workflows/cache-cleanup.yml@v1
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
 ```
 
 ## Caller pattern
